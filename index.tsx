@@ -4,27 +4,27 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import * as DataStore from "@api/DataStore";
 import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
+import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
+import { Button } from "@components/Button";
+import ErrorBoundary from "@components/ErrorBoundary";
+import { Text } from "@components/Text";
+import { settings as translateSettings } from "@plugins/translate/settings";
+import { TranslateIcon } from "@plugins/translate/TranslateIcon";
+import { translate, TranslationValue } from "@plugins/translate/utils";
 import definePlugin, { OptionType } from "@utils/types";
 import { Message } from "@vencord/discord-types";
 import {
-    Button,
     ChannelStore,
     GuildStore,
+    Menu,
     MessageStore,
     Parser,
     React,
     SelectedChannelStore,
-    Text,
     UserStore,
-    Menu,
 } from "@webpack/common";
-
-import { translate, TranslationValue } from "@plugins/translate/utils";
-import { settings as translateSettings } from "@plugins/translate/settings";
-import { TranslateIcon } from "@plugins/translate/TranslateIcon";
 
 const STORE_KEY = "AutoTranslateChannels_channelIds";
 
@@ -83,7 +83,7 @@ const settings = definePluginSettings({
         type: OptionType.SELECT,
         description: "Language to translate messages into",
         options: [
-            { label: "Русский", value: "ru", default: true },
+            { label: "Russian", value: "ru", default: true },
             { label: "English", value: "en" },
             { label: "Deutsch", value: "de" },
             { label: "Français", value: "fr" },
@@ -113,7 +113,7 @@ const settings = definePluginSettings({
     },
     showLabel: {
         type: OptionType.BOOLEAN,
-        description: "Show the 'Перевод' label when the original is visible",
+        description: "Show the 'Translation' label when the original is visible",
         default: true,
     },
 });
@@ -127,7 +127,7 @@ function emitChange() {
 
 function addListener(listener: () => void) {
     listeners.add(listener);
-    return () => listeners.delete(listener);
+    return () => { listeners.delete(listener); };
 }
 
 function isEnabled(channelId: string) {
@@ -166,7 +166,7 @@ const cache = new Map<string, CachedTranslation>();
 const pending = new Map<string, Promise<TranslationValue>>();
 const queue: Array<{
     key: string;
-    message: Message;
+    targetLanguage: string;
     content: string;
     resolve: (value: TranslationValue) => void;
     reject: (error: unknown) => void;
@@ -198,13 +198,13 @@ function persistTranslationCache() {
     void DataStore.set(CACHE_KEY, Object.fromEntries(entries));
 }
 
-function putCache(key: string, value: TranslationValue, original: string) {
+function putCache(key: string, value: TranslationValue, original: string, targetLanguage: string) {
     cache.delete(key);
     cache.set(key, {
         text: value.text,
         sourceLanguage: value.sourceLanguage,
         original,
-        targetLanguage: settings.store.targetLanguage,
+        targetLanguage,
     });
 
     while (cache.size > settings.store.cacheLimit) {
@@ -239,7 +239,7 @@ type TargetLanguage = {
 const TARGET_LANGUAGE_INFO: Record<string, TargetLanguage> = {
     ru: {
         code: "ru",
-        label: "Русский",
+        label: "Russian",
         script: "cyrillic",
         markers: [" и ", " в ", " не ", " на ", " что ", " это ", " как ", " для ", " но ", " или ", " уже ", " ещё ", " можно ", " нужно ", " будет ", " я ", " ты ", " мы ", " вы "],
         distinctive: /[ыэъё]/i,
@@ -437,7 +437,7 @@ function runQueue() {
         const job = queue.shift()!;
         activeTranslations++;
 
-        doTranslation(job.message, job.content, job.key)
+        doTranslation(job.content, job.key, job.targetLanguage)
             .then(job.resolve, job.reject)
             .finally(() => {
                 activeTranslations--;
@@ -446,34 +446,33 @@ function runQueue() {
     }
 }
 
-async function doTranslation(
-    message: Message,
-    content: string,
-    key = cacheKey(message, content),
-): Promise<TranslationValue> {
-    const cached = getCached(key);
-    if (cached) return cached;
-
-    // translate() reads receivedOutput synchronously before its network await.
-    // We temporarily set it so this plugin can have its own target language
-    // without permanently changing the user's Translate settings.
+function requestTranslation(content: string, targetLanguage: string): Promise<TranslationValue> {
+    const { service } = translateSettings.store;
+    const isDeepL = !IS_WEB && (service === "deepl" || service === "deepl-pro");
+    const output = isDeepL
+        ? ({ en: "en-us", pt: "pt-pt", "zh-CN": "zh-hans" }[targetLanguage] ?? targetLanguage)
+        : targetLanguage;
     const previousOutput = translateSettings.store.receivedOutput;
 
+    // Translate captures the language synchronously before returning its promise.
     try {
-        translateSettings.store.receivedOutput = settings.store.targetLanguage;
-        const result = await translate("received", content);
-        putCache(key, result, content);
-        return result;
+        translateSettings.store.receivedOutput = output;
+        return translate("received", content);
     } finally {
-        translateSettings.store.receivedOutput = previousOutput;
+        if (translateSettings.store.service === service) {
+            translateSettings.store.receivedOutput = previousOutput;
+        }
     }
 }
 
-function getTranslationWithKey(
-    message: Message,
-    content: string,
-    key: string,
-) {
+async function doTranslation(content: string, key: string, targetLanguage: string) {
+    const result = await requestTranslation(content, targetLanguage);
+    putCache(key, result, content, targetLanguage);
+    return result;
+}
+
+function getTranslation(message: Message, content: string) {
+    const key = cacheKey(message, content);
     const cached = getCached(key);
     if (cached) return Promise.resolve(cached);
 
@@ -483,7 +482,7 @@ function getTranslationWithKey(
     const promise = new Promise<TranslationValue>((resolve, reject) => {
         queue.push({
             key,
-            message,
+            targetLanguage: settings.store.targetLanguage,
             content,
             resolve,
             reject,
@@ -495,10 +494,6 @@ function getTranslationWithKey(
 
     pending.set(key, promise);
     return promise;
-}
-
-function getTranslation(message: Message, content: string) {
-    return getTranslationWithKey(message, content, cacheKey(message, content));
 }
 
 function getContent(message: Message): string {
@@ -555,8 +550,8 @@ function handleMessageDelete({ id, channelId }: { id?: string; channelId?: strin
     }
 }
 
-function handleMessageDeleteBulk({ ids }: { ids?: string[] }) {
-    ids?.forEach(handleMessageDelete);
+function handleMessageDeleteBulk({ ids, channelId }: { ids?: string[]; channelId?: string }) {
+    ids?.forEach(id => handleMessageDelete({ id, channelId }));
 }
 
 
@@ -570,7 +565,7 @@ function emitReplaceOriginalChange() {
 
 function addReplaceOriginalListener(listener: () => void) {
     replaceOriginalListeners.add(listener);
-    return () => replaceOriginalListeners.delete(listener);
+    return () => { replaceOriginalListeners.delete(listener); };
 }
 
 function markReplaceOriginalPatchActive() {
@@ -593,12 +588,14 @@ function ReplaceOriginalContent({
     message: Message;
     original: React.ReactNode;
 }) {
-    const pluginSettings = settings.use(["replaceOriginal"]);
+    const pluginSettings = settings.use(["replaceOriginal", "targetLanguage"]);
+    const enabled = React.useSyncExternalStore(addListener, () => isEnabled(message.channel_id));
     const [, forceUpdate] = React.useReducer(x => x + 1, 0);
 
     React.useEffect(() => addReplaceOriginalListener(forceUpdate), []);
+    React.useEffect(markReplaceOriginalPatchActive, []);
 
-    if (!pluginSettings.replaceOriginal || !isEnabled(message.channel_id)) {
+    if (!pluginSettings.replaceOriginal || !enabled) {
         return <>{original}</>;
     }
 
@@ -632,6 +629,10 @@ function ReplaceOriginalContent({
 
 const messageRevisions = new Map<string, number>();
 
+const renderReplacement = ErrorBoundary.wrap(ReplaceOriginalContent, {
+    fallback: ({ wrappedProps }) => wrappedProps?.original,
+});
+
 function bumpMessageRevision(messageId: string) {
     messageRevisions.set(messageId, (messageRevisions.get(messageId) ?? 0) + 1);
 }
@@ -643,12 +644,17 @@ function TranslationAccessory({ message }: { message: Message }) {
         "showLabel",
         "translateOwnMessages",
         "translateBots",
+        "targetLanguage",
+        "minLength",
+        "translateOnlyForeignText",
+        "ignoreNonText",
+        "onlyNewMessages",
     ]);
 
+    const enabled = React.useSyncExternalStore(addListener, () => isEnabled(message.channel_id));
     const content = getContent(message);
-    const [result, setResult] = React.useState<TranslationValue | null>(
-        getCachedForMessage(message, content),
-    );
+    const [result, setResult] = React.useState<TranslationValue | null>(null);
+    const canReplaceOriginal = React.useSyncExternalStore(addReplaceOriginalListener, () => replaceOriginalPatchActive);
 
 
     React.useEffect(() => {
@@ -658,10 +664,9 @@ function TranslationAccessory({ message }: { message: Message }) {
         // Discord re-renders the message component after MESSAGE_UPDATE.
         // Including content in the dependency list is important: an edited
         // message must not keep showing the translation of its old content.
-        const cached = getCachedForMessage(message, content);
-        setResult(cached);
+        setResult(null);
 
-        if (!isEnabled(message.channel_id) || !content) return;
+        if (!enabled || !content) return;
 
         if (!shouldTranslateMessage(message, content)) return;
 
@@ -680,12 +685,13 @@ function TranslationAccessory({ message }: { message: Message }) {
                 // same React component/message object during an edit.
                 if (
                     currentRevision !== revision ||
-                    currentMessage?.content !== content
+                    !currentMessage || getContent(currentMessage) !== content
                 ) {
                     return;
                 }
 
                 setResult(value);
+                emitReplaceOriginalChange();
             })
             .catch(() => {
                 if (!cancelled) setResult(null);
@@ -697,20 +703,21 @@ function TranslationAccessory({ message }: { message: Message }) {
     }, [
         message.id,
         message.channel_id,
+        enabled,
         content,
         pluginSettings.translateOwnMessages,
         pluginSettings.translateBots,
-        settings.store.targetLanguage,
-        settings.store.minLength,
-        settings.store.translateOnlyForeignText,
-        settings.store.ignoreNonText,
-        settings.store.onlyNewMessages,
+        pluginSettings.targetLanguage,
+        pluginSettings.minLength,
+        pluginSettings.translateOnlyForeignText,
+        pluginSettings.ignoreNonText,
+        pluginSettings.onlyNewMessages,
     ]);
 
-    if (!result?.text) return null;
+    if (!enabled || !result?.text) return null;
 
     const original = content;
-    if (pluginSettings.replaceOriginal && replaceOriginalPatchActive) {
+    if (pluginSettings.replaceOriginal && canReplaceOriginal) {
         return null;
     }
     if (result.text.trim() === original) return null;
@@ -736,7 +743,7 @@ function TranslationAccessory({ message }: { message: Message }) {
                         marginBottom: 2,
                     }}
                 >
-                    Перевод
+                    Translation
                 </div>
             )}
             {Parser.parse(result.text)}
@@ -763,8 +770,8 @@ function ChannelManager() {
         const channel = ChannelStore.getChannel(id);
         const guildId = channel?.guild_id ?? "direct";
         const guildName = channel?.guild_id
-            ? GuildStore.getGuild(channel.guild_id)?.name ?? "Неизвестный сервер"
-            : "Личные сообщения";
+            ? GuildStore.getGuild(channel.guild_id)?.name ?? "Unknown server"
+            : "Direct messages";
 
         const group = groups.get(guildId) ?? { name: guildName, ids: [] };
         group.ids.push(id);
@@ -773,7 +780,7 @@ function ChannelManager() {
 
     return (
         <div style={{ marginTop: 12 }}>
-            <Text variant="text-md/bold">Каналы автоперевода</Text>
+            <Text weight="bold">Auto-translate channels</Text>
 
             <div style={{ marginTop: 8, marginBottom: 12 }}>
                 <Button
@@ -781,23 +788,23 @@ function ChannelManager() {
                     onClick={addCurrentChannel}
                 >
                     {selectedChannelId && isEnabled(selectedChannelId)
-                        ? "Текущий канал уже добавлен"
-                        : "Добавить текущий канал"}
+                        ? "Current channel already added"
+                        : "Add current channel"}
                 </Button>
             </div>
 
             {groups.size === 0 ? (
-                <Text variant="text-sm/normal" style={{ opacity: 0.65 }}>
-                    Список пуст. Открой нужный канал и нажми «Добавить текущий канал».
+                <Text size="sm" style={{ opacity: 0.65 }}>
+                    Open a channel and select "Add current channel" to add it to the list.
                 </Text>
             ) : (
                 Array.from(groups.entries()).map(([guildId, group]) => (
                     <div key={guildId} style={{ marginBottom: 16 }}>
-                        <Text variant="text-sm/bold">{group.name}</Text>
+                        <Text size="sm" weight="bold">{group.name}</Text>
 
                         {group.ids.map(id => {
                             const channel = ChannelStore.getChannel(id);
-                            const name = channel?.name ? `#${channel.name}` : `Канал ${id}`;
+                            const name = channel?.name ? `#${channel.name}` : `Channel ${id}`;
 
                             return (
                                 <div
@@ -810,12 +817,12 @@ function ChannelManager() {
                                         gap: 12,
                                     }}
                                 >
-                                    <Text variant="text-sm/normal">{name}</Text>
+                                    <Text size="sm">{name}</Text>
                                     <Button
-                                        size={Button.Sizes.SMALL}
+                                        size="small"
                                         onClick={() => toggleChannel(id)}
                                     >
-                                        Убрать
+                                        Remove
                                     </Button>
                                 </div>
                             );
@@ -840,7 +847,7 @@ const channelContextPatch: NavContextMenuPatchCallback = (children, { channel }:
     group.push(
         <Menu.MenuItem
             id="auto-translate-channel"
-            label={enabled ? "Выключить автоперевод" : "Включить автоперевод"}
+            label={enabled ? "Disable auto-translate" : "Enable auto-translate"}
             action={() => toggleChannel(channel.id)}
         />,
     );
@@ -849,8 +856,11 @@ const channelContextPatch: NavContextMenuPatchCallback = (children, { channel }:
 export default definePlugin({
     name: "AutoTranslateChannels",
     description: "Automatically translates messages in selected Discord channels.",
-    tags: ["Translation", "Chat", "Utility"],
-    authors: [{ name: "GaapJagen", id: 298466559033344008n }],
+    tags: ["Chat", "Utility"],
+    authors: [
+        { name: "GaapJagen", id: 298466559033344008n },
+        { name: "WavvyAir", id: 358328430376255490n },
+    ],
 
     dependencies: ["Translate"],
 
@@ -860,22 +870,17 @@ export default definePlugin({
 
     patches: [
         {
-            find: "childrenMessageContent:n,onMouseMove:L",
+            find: /childrenMessageContent:\i,onMouseMove:/,
             replacement: {
-                match: /childrenMessageContent:n,onMouseMove:L/,
-                replace: "childrenMessageContent:$self.renderMessageContent(n,arguments[0].message),onMouseMove:L",
+                match: /(?<=childrenMessageContent:)(\i)(?=,onMouseMove:)/,
+                replace: "$self.renderMessageContent($1,arguments[0]?.message)",
             },
         },
     ],
 
-    renderMessageContent(original: React.ReactNode, message: Message) {
-        markReplaceOriginalPatchActive();
-        return (
-            <ReplaceOriginalContent
-                message={message}
-                original={original}
-            />
-        );
+    renderMessageContent(original: React.ReactNode, message?: Message) {
+        if (!message?.channel_id) return original;
+        return renderReplacement({ message, original });
     },
 
     contextMenus: {
@@ -897,17 +902,15 @@ export default definePlugin({
     messagePopoverButton: {
         icon: TranslateIcon,
         render(message: Message) {
-            if (!settings.store.replaceOriginal) return null;
+            if (!settings.store.replaceOriginal || !replaceOriginalPatchActive) return null;
             if (!isEnabled(message.channel_id)) return null;
 
             const content = getContent(message);
             if (!content) return null;
 
             return {
-                label: originalVisibility.get(message.id) ? "Скрыть оригинал" : "Оригинал",
+                label: originalVisibility.get(message.id) ? "Hide original" : "Show original",
                 icon: TranslateIcon,
-                message,
-                channel: ChannelStore.getChannel(message.channel_id),
                 onClick: () => toggleOriginal(message),
             };
         },
